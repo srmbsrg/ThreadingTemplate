@@ -1,0 +1,1931 @@
+Explain the benefits of this code snipit: using log4net;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using tcore.DataContract;
+using System.Linq;
+using System.Collections;
+using System.Web.Script.Serialization;
+using tcore.Facades;
+using tcore.BusinessObjects.MAILHOUSE;
+using System.IO.Compression;
+using System.Text;
+using tcore.FileServerManager;
+using tcore.Common;
+using tcore.BusinessObjects;
+using System.Threading;
+
+namespace tcore.Task
+{
+    public class DocumentNOTDExportTask : ScheduledTask
+    {
+        private static readonly ILog log = LogManager.GetLogger(typeof(DocumentExportTask));
+        private int UpdUserID = 0;
+        private string _outDirectory;
+        private string _tempDirectory;
+        private string _archiveDirectory;
+        private string _failedDirectory;
+        private string _ImageLocalDirectory;
+        private string _returnedDocsDirectory;
+        private string _NcoaNixieFolder;
+        private string _NocaNixieUploadFolder;
+        private string _tempNOTDDirectory;
+
+        private IFileServerManager fileServerManager;
+        private bool enabledFTP = false;
+        private string outgoingFTPLocation = string.Empty;
+        private string outgoingFTPUser = string.Empty;
+        private string outgoingFTPPassword = string.Empty;
+        private string outgoingFTPEnableSSL = string.Empty;
+
+        private string outgoingFTPDailyFilesFinalFolder = string.Empty;
+        private string outgoingFTPDailyFilesFolder = string.Empty;
+        private string outgoingFTPDEvidenceTempFolder = string.Empty;
+        private string outgoingFTPDailyEvidenceFolder = string.Empty;
+
+        //private string NixieNCOASNeededToSend = string.Empty;
+        private string NocaNixieUploadFolder = string.Empty;
+
+        private bool parallelProcess = false;
+        protected int maxDegreeOfParallel { get; set; }
+        protected int BatchSizeToProcess = 0;
+        protected int BatchSizeToProcessWImages = 0;
+        protected int TaskBundleSize = 0;
+
+        List<MHDataFilesDC> DataFileTypeInfo = new List<MHDataFilesDC>();
+
+        private bool processSubsetInParallel = false;
+
+        private bool exportSubsetInParallel = false;
+        private bool exportMissedFiles = false;
+
+        protected List<long> erroredNOTD = new List<long>();
+
+        private MHStatementManagerBO _MHBO;
+
+        Dictionary<string, string> imgsToTransfer = new Dictionary<string, string>();
+        List<string> pdfsToTransfer = new List<string>();
+
+
+        public string strJsData = "";
+        public DocumentNOTDExportTask()
+        {
+            _MHBO = new MHStatementManagerBO();
+        }
+
+        private bool useSshPrivateKey = false;
+        private string sshPrivateKeyPath = string.Empty;
+        private string sshPrivateKeyPassphrase = string.Empty;
+
+        private static object locker = new Object();
+
+        private bool NotIndNOTDS = false;
+
+        void Initialization()
+        {
+            _outDirectory = Common.Utils.GetConfiguration("OutDirectory");
+            _tempDirectory = Common.Utils.GetConfiguration("TempDirectory");
+            _archiveDirectory = Common.Utils.GetConfiguration("ArchiveDirectory");
+            _failedDirectory = Common.Utils.GetConfiguration("FailedDirectory");
+            _returnedDocsDirectory = Common.Utils.GetConfiguration("ReturnedDocsDirectory");
+            _ImageLocalDirectory = Common.Utils.GetConfiguration("ImageLocalDirectory");
+            _tempNOTDDirectory = Common.Utils.GetConfiguration("TempNOTDDirectory");
+
+
+            if (Common.Utils.GetConfiguration("FTPEnabled").ToUpper() == "TRUE")
+            {
+                enabledFTP = true;
+            }
+
+            outgoingFTPLocation = Common.Utils.GetConfiguration("OutgoingFTPLocation");
+            outgoingFTPUser = Common.Utils.GetConfiguration("OutgoingFTPUser");
+            outgoingFTPPassword = Common.Utils.GetConfiguration("OutgoingFTPPassword");
+            outgoingFTPEnableSSL = Common.Utils.GetConfiguration("OutgoingFTPEnableSSL");
+            UpdUserID = Convert.ToInt32(Common.Utils.GetConfiguration("UserID"));
+
+
+            outgoingFTPDailyFilesFolder = Common.Utils.GetConfiguration("OutgoingFTPDailyFilesFolder");
+            outgoingFTPDailyFilesFinalFolder = Common.Utils.GetConfiguration("OutgoingFTPDailyFilesFinalFolder");
+            outgoingFTPDEvidenceTempFolder = Common.Utils.GetConfiguration("OutgoingFTPDEvidenceTempFolder");
+            outgoingFTPDailyEvidenceFolder = Common.Utils.GetConfiguration("OutgoingFTPDailyEvidenceFolder");
+
+            if (Common.Utils.GetConfiguration("ParallelProcess").ToUpper() == "TRUE")
+            {
+                parallelProcess = true;
+            }
+
+            maxDegreeOfParallel = Convert.ToInt16(tcore.Common.Utils.GetConfiguration("MaxDegreeOfParallel"));
+            TaskBundleSize = Convert.ToInt32(tcore.Common.Utils.GetConfiguration("TaskBundleSize"));
+            BatchSizeToProcess = Convert.ToInt16(Common.Utils.GetConfiguration("BatchSizeToProcess"));
+            BatchSizeToProcessWImages = Convert.ToInt16(Common.Utils.GetConfiguration("BatchSizeToProcessWImages"));
+
+            if (Common.Utils.GetConfiguration("ProcessSubsetInParallel").ToUpper() == "TRUE")
+            {
+                processSubsetInParallel = true;
+            }
+
+            if (Common.Utils.GetConfiguration("ExportSubsetInParallel").ToUpper() == "TRUE")
+            {
+                exportSubsetInParallel = true;
+            }
+
+            if (Common.Utils.GetConfiguration("ExportMissedFiles").ToUpper() == "TRUE")
+            {
+                exportMissedFiles = true;
+            }
+
+            long NixieNCOASNeededToSend = Convert.ToInt16(tcore.Common.Utils.GetConfiguration("NixieNCOASNeededToSend"));
+            _NocaNixieUploadFolder = tcore.Common.Utils.GetConfiguration("NocaNixieUploadFolder");
+            _NcoaNixieFolder = Common.Utils.GetConfiguration("NcoaNixieFolder");
+
+            if (Common.Utils.GetConfiguration("useSshPrivateKey").ToUpper() == "TRUE")
+            {
+                useSshPrivateKey = true;
+            }
+            sshPrivateKeyPath = Common.Utils.GetConfiguration("sshPrivateKeyPath");
+            sshPrivateKeyPassphrase = Common.Utils.GetConfiguration("sshPrivateKeyPassphrase");
+
+            if(Common.Utils.GetConfiguration("NewNonNOTDFormat").ToUpper() == "TRUE")
+            {
+                NotIndNOTDS = true;
+            }
+        }
+
+        override public void RunTask()
+        {
+            SuccessDC success = new SuccessDC();
+            List<MHHeaderRecordDC> notdFilesToProcess = new List<MHHeaderRecordDC>();
+            List<MHHeaderRecordDC> filesToProcessWIndividualTolls = new List<MHHeaderRecordDC>();
+            List<MHHeaderRecordDC> lastNotds = new List<MHHeaderRecordDC>();
+
+            Initialization();
+
+            DataFileTypeInfo = _MHBO.GetDataFilesAll();
+
+            if (NotIndNOTDS)
+            {
+                notdFilesToProcess = GetDataFileListToProcess();
+
+                notdFilesToProcess = notdFilesToProcess
+                    .Where(a => a.fileType == "NOTDSUMMARY" || a.fileType == "NOTDSUMMARYRI")
+                    .OrderBy(a => a.fileType)
+                    .ThenBy(a => a.accountId)
+                    .ThenBy(a => a.dataHeaderId)
+                    .Distinct()
+                    .ToList();
+
+                //this is slo mo mode if u need to debug
+                //notdBatchProcess(filesToProcess, NotIndNOTDS, _outDirectory, _MHBO);
+
+                for (int i = 0; i < notdFilesToProcess.Count(); i = i + (notdFilesToProcess.Count() / TaskBundleSize))
+                {
+                    List<MHHeaderRecordDC> notdChunkToProcess = new List<MHHeaderRecordDC>();
+                    notdChunkToProcess = notdFilesToProcess.Take(TaskBundleSize).ToList();
+
+                    Console.WriteLine(notdChunkToProcess.Count().ToString() + " chunk of: " + notdFilesToProcess.Count().ToString() + " processing...");
+
+                    List<MHHeaderRecordDC> removeList = new List<MHHeaderRecordDC>();
+                    removeList = notdFilesToProcess.Take(TaskBundleSize).ToList();
+
+                    System.Threading.Tasks.Task task = ProcessBatchTask(notdChunkToProcess, BatchSizeToProcessWImages, NotIndNOTDS, _outDirectory, _MHBO);
+                    task.Wait();
+                    Console.WriteLine("Batch completed...");
+
+                    foreach (var r in removeList)
+                    {
+                        var itemToRemove = notdFilesToProcess.Single(n => n.batchId == r.batchId);
+                        notdFilesToProcess.Remove(itemToRemove);
+                    }
+                    Console.WriteLine(removeList.Count().ToString() + " processed and removed.");
+                }
+
+
+                Console.WriteLine("completed task.");
+                log.Debug("completed task.");
+            }
+            else //notd summary and notd singles (MDTA-8585 will replace)
+            {
+                notdFilesToProcess = GetDataFileListToProcess();
+
+                notdFilesToProcess = notdFilesToProcess
+                    .Where(a => a.fileType == "NOTDSUMMARY" || a.fileType == "NOTDSUMMARYRI")
+                    .OrderBy(a => a.fileType)
+                    .ThenBy(a => a.accountId)
+                    .ThenBy(a => a.dataHeaderId)
+                    .Distinct()
+                    .ToList();
+
+                for (int i = 0; i < notdFilesToProcess.Count(); i = i + (notdFilesToProcess.Count() / TaskBundleSize))
+                {
+                    List<MHHeaderRecordDC> notdChunkToProcess = new List<MHHeaderRecordDC>();
+                    notdChunkToProcess = notdFilesToProcess.Take(TaskBundleSize).ToList();
+
+                    Console.WriteLine(notdChunkToProcess.Count().ToString() + " chunk of: " + notdFilesToProcess.Count().ToString() + " processing...");
+
+                    List<MHHeaderRecordDC> removeList = new List<MHHeaderRecordDC>();
+                    removeList = notdFilesToProcess.Take(TaskBundleSize).ToList();
+
+                    System.Threading.Tasks.Task<SuccessDC> task = ProcessBatchTask(notdChunkToProcess, BatchSizeToProcessWImages, NotIndNOTDS, _outDirectory, _MHBO);
+                    task.Wait();
+                    Console.WriteLine("Batch completed...");
+
+                    RemoveProcessedFromList(notdFilesToProcess, removeList);
+                }
+
+                //reallocate memory
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+            }
+        }
+
+        private static void RemoveProcessedFromList(List<MHHeaderRecordDC> notdFilesToProcess, List<MHHeaderRecordDC> removeList)
+        {
+            System.Threading.Tasks.Parallel.ForEach(removeList, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = -1 }, r =>
+            {
+                var itemToRemove = notdFilesToProcess.Single(n => n.batchId == r.batchId);
+                notdFilesToProcess.Remove(itemToRemove);
+            });
+
+            Console.WriteLine(removeList.Count().ToString() + " processed and removed.");
+        }
+
+        public static async  System.Threading.Tasks.Task<SuccessDC> ProcessBatchTask(List<MHHeaderRecordDC> notdFilesToProcess, int BatchSizeToProcessWImages, bool NotIndNOTDS, string _outDirectory, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+
+            await System.Threading.Tasks.Task.Run(() =>
+            {
+                int threadCount = (notdFilesToProcess.Count / (BatchSizeToProcessWImages));
+                if (threadCount <= 1)
+                {
+                    threadCount = 1;
+                }
+                else
+                {
+                    int remainder, quotient = Math.DivRem(notdFilesToProcess.Count, (BatchSizeToProcessWImages), out remainder);
+                    if (remainder > 0)
+                        threadCount = threadCount + 1;
+                }
+
+                Thread[] notdThread = new Thread[threadCount];
+                List<Thread> notdThreadList = new List<Thread>();
+                int threadIteration = 0;
+
+                for (int i = 0; i < notdFilesToProcess.Count(); i = i + (BatchSizeToProcessWImages))
+                {
+                    List<MHHeaderRecordDC> fileChunkToProcess = notdFilesToProcess.Skip(i).Take(BatchSizeToProcessWImages).ToList();
+
+                    notdThread[threadIteration] = new Thread(() => notdBatchProcess(fileChunkToProcess, NotIndNOTDS, _outDirectory, _MHBO, BatchSizeToProcessWImages));
+                    notdThread[threadIteration].Start();
+
+                    notdThreadList.Add(notdThread[threadIteration]);
+                    threadIteration = threadIteration + 1;
+                }
+
+                foreach (Thread t in notdThreadList)
+                {
+                    t.Join();
+                }
+            });
+
+            success.blnSuccess = true;
+            return success;
+        }
+
+        static readonly object notdLock = new object();
+        public static SuccessDC  notdBatchProcess(List<MHHeaderRecordDC> filesToProcess, bool NotIndNOTDS, string _outDirectory, MHStatementManagerBO _MHBO, int BatchSizeToProcessWImages)
+        {
+            SuccessDC success = new SuccessDC();
+            List<MHHeaderRecordDC> filesToProcessWIndividualTolls = new List<MHHeaderRecordDC>();
+            List<long> invoicesToAdd = new List<long>();
+
+
+            if (NotIndNOTDS) //this will be the new norm without the NOTD file
+            {
+                if (filesToProcess.Count > 0)
+                {
+                    List<MHHeaderRecordDC> NOTDsummarys = new List<MHHeaderRecordDC>();
+
+                    Console.WriteLine("Begin processing NOTDSUMMARYS ...");
+                    NOTDsummarys = filesToProcess.Where(a => a.fileType == "NOTDSUMMARY").ToList();
+                    success = ProcessSubSetOfFiles(NOTDsummarys, _MHBO);
+
+                    //this is used in the naming convention of each batch at time of write
+                    string commonTrackerID = DateTime.Now.ToString("yyyyMMddHHmmss");
+
+                    //JSONs
+                    success = ExportSubSetOfFiles(commonTrackerID, NotIndNOTDS, _outDirectory, _MHBO);
+
+                    //images
+                    success = ExportSubSetOfImages(NOTDsummarys, commonTrackerID, NotIndNOTDS, _outDirectory, _MHBO, BatchSizeToProcessWImages);
+                }
+            }
+            else
+            {
+                //grab transactions and makes individual NOTDS in tbHeaderRecords table to export
+                System.Threading.Tasks.Parallel.ForEach(filesToProcess, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = -1 }, file =>
+                {
+                    try
+                    {
+                        Console.WriteLine("Adding batch of invoices for NOTDS from NOTDSUMMARYS.");
+                        invoicesToAdd = AddNOTDStoQNOtificationsFromSummaries(file.qRequestId, file.fileType, _MHBO);
+
+                        foreach (long individualNOTD in invoicesToAdd)
+                        {
+                            var notdAdd = _MHBO.GetHeaderRecordByHeaderID(Convert.ToInt64(individualNOTD));
+                            if (notdAdd.Count > 0)
+                                try
+                                {
+                                    filesToProcessWIndividualTolls.Add(notdAdd[0]);
+                                }
+                                catch { };
+                        }
+
+                        if (file != null)
+                        {
+                            filesToProcessWIndividualTolls.Add(file);
+                        };
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Error(ex.Message, ex);
+                    }
+                });
+
+                
+                if (filesToProcessWIndividualTolls.Count > 0)
+                {
+                    List<MHHeaderRecordDC> NOTDsummarys = new List<MHHeaderRecordDC>();
+                    List<MHHeaderRecordDC> NOTDS = new List<MHHeaderRecordDC>();
+
+                    Console.WriteLine("Begin processing NOTDSUMMARYS ...");
+                    try
+                    {
+                        NOTDsummarys = filesToProcessWIndividualTolls.Where(a => a.fileType == "NOTDSUMMARY" || a.fileType == "NOTDSUMMARYRI").ToList();
+                        success = ProcessSubSetOfFiles(NOTDsummarys, _MHBO);
+
+                        string commonTrackerID = NOTDsummarys[0].batchId.ToString();
+
+                        success.blnSuccess = true;
+                        if (success.blnSuccess)
+                        {
+                            Console.WriteLine("Begin processing NOTDS ...");
+                            NOTDS = filesToProcessWIndividualTolls.Where(a => a.fileType == "NOTD" || a.fileType == "NOTDRI").ToList();
+                            success = ProcessSubSetOfFiles(NOTDS, _MHBO);
+                            filesToProcessWIndividualTolls.Clear();
+                        }
+
+                        success.blnSuccess = true;
+                        if (success.blnSuccess)
+                        {
+                            //images
+                            success = ExportSubSetOfImages(NOTDsummarys, commonTrackerID, NotIndNOTDS, _outDirectory, _MHBO, BatchSizeToProcessWImages);
+                        }
+
+                        success.blnSuccess = true;
+                        if (success.blnSuccess)
+                        {
+                            //JSONs
+                            success = ExportSubSetOfFiles(commonTrackerID, NotIndNOTDS, _outDirectory, _MHBO);
+                        }
+
+                        filesToProcessWIndividualTolls.Clear();
+                    }
+                    catch { }
+
+                    //doc main uploads for now
+                    //UploadFiles();
+                }
+            }
+
+            success.blnSuccess = true;
+            return success;
+        }
+
+        private static SuccessDC ExportSubSetOfImages (List<MHHeaderRecordDC> NOTDsummarys, string commonTrackerID, bool NotIndNOTDS, string _outDirectory, MHStatementManagerBO _MHBO, int BatchSizeToProcessWImages)
+        {
+
+            SuccessDC success = new SuccessDC();
+
+            Dictionary<string, string> filesToZip = GetImagesToTransfer(NOTDsummarys, _MHBO);
+            if (NotIndNOTDS)
+            {
+                string zipName = "MDTA_MH_" + NOTDsummarys[0].fileType + "_" + commonTrackerID;
+                System.Threading.Tasks.Task task = ZipBundlesWImages(zipName, filesToZip, _outDirectory, BatchSizeToProcessWImages);
+                task.Wait();
+            }
+            else
+            {
+                string zipName = "MDTA_MH_NOTD_" + commonTrackerID;
+                System.Threading.Tasks.Task task = ZipBundlesWImages(zipName, filesToZip, _outDirectory, BatchSizeToProcessWImages);
+                task.Wait();
+            }
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            success.blnSuccess = true;
+            return success;
+        }
+
+        private static Dictionary<string, string> GetImagesToTransfer(List<MHHeaderRecordDC> NOTDsummarys, MHStatementManagerBO _MHBO)
+        {
+            List<MHNotdSummaryDC> summarys = new List<MHNotdSummaryDC>();
+            Dictionary<string, string> filesToZip = new Dictionary<string, string>();
+            string img = string.Empty;
+            string path = string.Empty;
+
+            foreach (var notd in NOTDsummarys)
+            {
+                try
+                {
+                    var item = _MHBO.GetNOTDSummaryByHeaderID(notd.batchId);
+                    summarys.Add(item[0]);
+                }
+                catch { } //swallow error and move on if the image can not be found
+            }
+
+            foreach(var s in summarys)
+            {
+                //full vehicle image
+                var lastSlashIndex = s.imageName.LastIndexOf('\\');
+                img = s.imageName.Substring((lastSlashIndex + 1));
+                path = s.imageName.Substring(0, s.imageName.Length - img.Length);
+                if (!filesToZip.ContainsKey(img))
+                    try
+                    {
+                        filesToZip.Add(img, path);
+                    }
+                    catch { } //swallow error and move on if the image can not be found
+                else
+                {
+                    var m = img;
+                }
+                //lpr plate image
+                lastSlashIndex = s.imageROIName.LastIndexOf('\\');
+                img = s.imageROIName.Substring((lastSlashIndex + 1));
+                path = s.imageROIName.Substring(0, s.imageROIName.Length - img.Length);
+                if (!filesToZip.ContainsKey(img))
+                    try
+                    {
+                        filesToZip.Add(img, path);
+                    }
+                    catch { } //swallow error and move on if the image can not be found
+                else
+                {
+                    var m = img;
+                }
+            }
+            return filesToZip;
+        }
+
+        public static SuccessDC ProcessSubSetOfFiles(List<MHHeaderRecordDC> filesToProcess, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+
+            filesToProcess = filesToProcess.OrderBy(a => a.fileType).ThenBy(a => a.dataHeaderId).ToList();
+            System.Threading.Tasks.Parallel.ForEach(filesToProcess, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = -1 }, file =>
+            {
+                try
+                {
+                    success = ProcessFileData(file, _MHBO);
+                }
+                catch { }
+                if (!success.blnSuccess)
+                    ErrorHeaderFile(file, success, success.vcResult, _MHBO);
+            });
+
+            success.blnSuccess = true;
+            return success;
+        }
+
+        public static  SuccessDC ExportSubSetOfFiles(string commonNameTracker, bool NotIndNOTDS, string _outDirectory, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+            List<MHHeaderRecordDC> filesToExport = new List<MHHeaderRecordDC>();
+            List<MHHeaderRecordDC> subsetOFfilesToExport = new List<MHHeaderRecordDC>();
+            List<string> fileTypes = new List<string>();
+
+
+            filesToExport = _MHBO.GetDataFilesToExport().Where(a => a.fileType.Contains("NOTD"))
+                                                        .OrderByDescending(a => a.fileType)
+                                                        .ThenBy(a => a.dataHeaderId).ToList();
+
+            fileTypes = filesToExport.Select(a => a.fileType).Distinct().ToList();
+            
+            foreach (var fileType in fileTypes)
+            {
+                try
+                {
+                    List<MHHeaderRecordDC> SubsetOffilesToExport = filesToExport.Where(a => a.fileType == fileType).ToList();
+                    success = CreateBundledFilesToTransfer(SubsetOffilesToExport,commonNameTracker, NotIndNOTDS, _outDirectory, _MHBO);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.Message);
+                    log.Error(ex.Message, ex);
+                    success.vcResult = ex.Message;
+                }
+            }
+
+            return success;
+        }
+
+
+        private static SuccessDC ProcessFileData(MHHeaderRecordDC file, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+            MHCommonFieldsDC commonFields = new MHCommonFieldsDC();
+
+            if (file.accountId <= 0 || file.batchId <= 0)
+            {
+                success.blnSuccess = true;
+                success.vcResult = file.batchId + " : Account or HeaderRecord not found. : will not process";
+                log.Error(file.batchId + " : Account or HeaderRecord not found : will not process");
+                return success;
+            }
+
+            try
+            {
+                switch (file.fileType)
+                {
+                    case "NOTD":
+                        _MHBO.InsertCommonFieldsByRequestIdFromAMS(file.accountId, file.batchId, file.dataFileId, file.qRequestId);
+                        break;
+                    case "NOTDRI":
+                        _MHBO.InsertCommonFieldsByRequestIdFromAMS(file.accountId, file.batchId, file.dataFileId, file.qRequestId);
+                        break;
+                    default:
+                        _MHBO.InsertCommonFieldsFromAMS(file.accountId, file.batchId, file.dataFileId);
+                        break;
+                }
+
+                //based on document type in DB
+                switch (file.fileType)
+                {
+                    case "NOTDSUMMARY":
+                        _MHBO.InsertNotdSummaryFromAMS(file.batchId);
+                        success.blnSuccess = true;
+                        break;
+                    case "NOTDSUMMARYRI":
+                        _MHBO.InsertNotdSummaryRiFromAMS(file.batchId);
+                        success.blnSuccess = true;
+                        break;
+                    case "NOTD":
+                        _MHBO.InsertNotdFromAMS(file.batchId);
+                        success.blnSuccess = true;
+                        break;
+                    case "NOTDRI":
+                        _MHBO.InsertNotdRiFromAMS(file.batchId);
+                        success.blnSuccess = true;
+                        break;
+                    default:
+                        success.blnSuccess = true;
+                        break;
+                }
+
+                if (success.blnSuccess)
+                {
+                    //mark header as processed
+                    _MHBO.UpdateHeaderRecordAsProcessed(file.batchId);
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.Message, ex);
+                success.vcResult = ex.Message;
+            }
+            return success;
+        }
+
+        private static SuccessDC CreateFilesToTransfer(MHHeaderRecordDC headerFile, bool NotIndNOTDS, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+            object bodyData = null;
+            object translatedBodyData = null;
+
+            try
+            {
+                switch (headerFile.fileType)
+                {
+                    case "NOTDSUMMARY":
+                        bodyData = _MHBO.GetNOTDSummaryByHeaderID(headerFile.batchId);
+                        if (bodyData != null)
+                        {
+                            success = TranslateNotdSummaryBodyData(bodyData, headerFile ,NotIndNOTDS, _MHBO);
+                            if (success.blnSuccess)
+                            {
+                                translatedBodyData = success.objData;
+                                success.blnSuccess = true;
+                            }
+                        }
+                        else
+                        {
+                            log.Error("CreateFilesToTransfer: HeaderID: " + headerFile.batchId + " bodyData failed to translate.");
+                            success.blnSuccess = false;
+                        }
+                        break;
+                    case "NOTDSUMMARYRI":
+                        bodyData = _MHBO.GetNoTDSummaryRIByHeaderID(headerFile.batchId);
+                        if (bodyData != null)
+                        {
+                            success = TranslateNotdSummaryRiBodyData(bodyData, headerFile, NotIndNOTDS, _MHBO);
+                            if (success.blnSuccess)
+                            {
+                                translatedBodyData = success.objData;
+                                success.blnSuccess = true;
+                            }
+                        }
+                        else
+                        {
+                            log.Error("CreateFilesToTransfer: HeaderID: " + headerFile.batchId + " bodyData failed to translate.");
+                            success.blnSuccess = false;
+                        }
+                        break;
+                    case "NOTD":
+                        bodyData = _MHBO.GetNoTDByHeaderID(headerFile.batchId);
+                        if (bodyData != null)
+                        {
+                            success = TranslateNotdBodyData(bodyData, headerFile, _MHBO);
+                            if (success.blnSuccess)
+                            {
+                                translatedBodyData = success.objData;
+                                success.blnSuccess = true;
+                            }
+                        }
+                        else
+                        {
+                            log.Error("CreateFilesToTransfer: HeaderID: " + headerFile.batchId + " bodyData failed to translate.");
+                            success.blnSuccess = false;
+                        }
+                        break;
+                    case "NOTDRI":
+                        bodyData = _MHBO.GetNoTDRIByHeaderID(headerFile.batchId);
+                        if (bodyData != null)
+                        {
+                            success = TranslateNotdRiBodyData(bodyData, headerFile, _MHBO);
+                            if (success.blnSuccess)
+                            {
+                                translatedBodyData = success.objData;
+                                success.blnSuccess = true;
+                            }
+                        }
+                        else
+                        {
+                            log.Error("CreateFilesToTransfer: HeaderID: " + headerFile.batchId + " bodyData failed to translate.");
+                            success.blnSuccess = false;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+
+                //serialize data for export
+                if (success.blnSuccess)
+                {
+                    success.objData = translatedBodyData;
+                }
+                else
+                {
+                    Console.WriteLine("CreateFilesToTransfer FAILED success : " + success.blnSuccess);
+                    log.Error("CreateFilesToTransfer FAILED success : " + success.blnSuccess);
+                }
+            }
+            catch(Exception ex)
+            {
+                Console.WriteLine(" err: " + ex.Message);
+                log.Error(ex.Message, ex);
+            }
+
+            return success;
+        }
+
+        private static SuccessDC CreateBundledFilesToTransfer(List<MHHeaderRecordDC> headerFiles, string commonNameTracker, bool NotIndNOTDS, string _outDirectory, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+            object translatedBodyData = null;
+            List<object> translatedBodies = new List<object>();
+            List<MHCommonAndBodyDataDC> bundledFiles = new List<MHCommonAndBodyDataDC>();
+            List<MHCommonAndBodyDataDC> excludedEmailFiles = new List<MHCommonAndBodyDataDC>();
+
+            foreach (MHHeaderRecordDC headerFile in headerFiles)
+            {
+                try
+                {
+                    MHCommonAndBodyDataDC commonAndBody = new MHCommonAndBodyDataDC();
+                    success = null;
+
+                    try
+                    {
+                        success = CreateFilesToTransfer(headerFile, NotIndNOTDS, _MHBO);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Error(ex.Message, ex);
+                    }
+
+                    if (success.blnSuccess)
+                    {
+                        translatedBodyData = success.objData;
+                        commonAndBody.headerBatchId = headerFile.batchId;
+                        commonAndBody.bodyDataFiles = translatedBodyData;
+
+                        if (commonAndBody.bodyDataFiles != null)
+                        {
+                            bundledFiles.Add(commonAndBody);
+                            _MHBO.UpdateHeaderRecordAsAddedToJson(headerFile.batchId);
+                        }
+                        Console.WriteLine("Bundled for export: " + headerFile.batchId);
+                    }
+                    else
+                    {
+                        //there was a problem.  Mark it as errored
+                        try
+                        {
+                            ErrorHeaderFile(headerFile, success, "Bundled for export: " + headerFile.batchId.ToString() + "Err: " + success.vcResult ?? "unkown.", _MHBO);
+                        }
+                        catch { };  //when a time-out occurs, it has already errored so no since erroring again to say there was an error
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(headerFiles[0].dataHeaderId + " err: " + ex.Message);
+                    log.Error(ex.Message, ex);
+                }
+            }
+
+            success.blnSuccess = true;
+
+            if (success.blnSuccess)
+            {
+                try
+                {
+                    //delete those not being sent because wrong delivery type
+                    System.Threading.Tasks.Parallel.ForEach(excludedEmailFiles, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = -1 }, ex =>
+                    {
+                        try
+                        {
+                            _MHBO.DeleteHeaderRecordByHeaderID(ex.headerBatchId);
+                        }
+                        catch { }; //when a time-out occurs, it has already errored so no since erroring again to say there was an error
+                    });
+
+
+                    //before exporting, lets put all componets into one Export Data Contract for proper formatting
+                    MHBundledExportDC exportData = TranslateBundleForExport(bundledFiles, headerFiles[0],commonNameTracker, _MHBO);
+                    
+                    if (Convert.ToInt32(exportData.recordCount) > 0)
+                    {
+                        string jsonName = "MDTA_MH_" + headerFiles[0].fileType + "_" + commonNameTracker;
+
+                        JavaScriptSerializer json = new JavaScriptSerializer();
+                        json.MaxJsonLength = Int32.MaxValue;
+                        var strJson = json.Serialize(exportData);
+
+                        Console.WriteLine("Generating JSON file for: " + headerFiles[0].fileType.ToString() + jsonName + ".JSON");
+                        File.WriteAllText(Path.Combine(_outDirectory, jsonName + ".JSON"), strJson);
+
+                        //save file name to DB
+                        System.Threading.Tasks.Parallel.ForEach(headerFiles, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = -1 }, hr =>
+                        {
+                            try
+                            {
+                                _MHBO.UpdateHeaderRecordWithJsonFileName(hr.batchId, jsonName);
+                            }
+                            catch { } //when a time-out occurs, it has already errored so no since erroring again to say there was an error
+                        });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(headerFiles[0].dataHeaderId + " err: " + ex.Message);
+                    log.Error(ex.Message, ex);
+                }
+            }
+
+            success.blnSuccess = true;
+            return success;
+        }
+
+        public static void ErrorHeaderFile(MHHeaderRecordDC headerFile, SuccessDC success, string from, MHStatementManagerBO _MHBO)
+        {
+            try
+            {
+                _MHBO.UpdateHeaderRecordAsErrored(headerFile.batchId, from + ": " + success.vcResult);
+            }
+            catch { } //when a time-out occurs, it has already errored so no since erroring again to say there was an error
+        }
+
+        private static async System.Threading.Tasks.Task<SuccessDC> ZipBundlesWImages(string zipFileName, Dictionary<string, string> imgsToTransfer, string _outDirectory, int BatchSizeToProcessWImages)
+        {
+            SuccessDC success = new SuccessDC();
+
+            await System.Threading.Tasks.Task.Run(() =>
+            {
+                //isolate image collection for these zips only
+                Dictionary<string, string> filesToZip = new Dictionary<string, string>(imgsToTransfer);
+
+                Console.WriteLine("Images to zip count: " + filesToZip.Count().ToString());
+
+                //this is slow mo mode in case you need to debug
+                //zipBatch(zipFileName + "_1.zip", filesToZip, _outDirectory);
+
+                int threadCount = (filesToZip.Count / (BatchSizeToProcessWImages));
+                if (threadCount <= 1)
+                {
+                    threadCount = 1;
+                }
+                else
+                {
+                    int remainder, quotient = Math.DivRem(filesToZip.Count, (BatchSizeToProcessWImages), out remainder);
+                    if (remainder > 0)
+                        threadCount = threadCount + 1;
+                }
+
+                Thread[] zipThread = new Thread[threadCount];
+                List<Thread> zipThreadList = new List<Thread>();
+                int threadIteration = 0;
+
+                long zipItemCount = 1;
+                string zipIterationName = string.Empty;
+                for (int i = 0; i < filesToZip.Count(); i = i + (BatchSizeToProcessWImages))
+                {
+                    var fileChunkToZip = filesToZip.Skip(i).Take(BatchSizeToProcessWImages).ToList();
+                    zipIterationName = zipFileName + "_" + (threadIteration + 1).ToString() + ".zip";
+
+                    zipThread[threadIteration] = new Thread(() => zipBatch(zipIterationName, fileChunkToZip, _outDirectory));
+                    zipThread[threadIteration].Start();
+
+                    Console.Write("thread: " + (threadIteration + 1) + " processing");
+
+                    zipThreadList.Add(zipThread[threadIteration]);
+                    threadIteration = threadIteration + 1;
+                    zipItemCount = zipItemCount + 1;
+
+                    foreach (Thread t in zipThreadList)
+                    {
+                        t.Join();
+                    }
+                }
+            });
+
+            success.blnSuccess = true;
+            return success;
+        }
+
+        static readonly object zipLock = new object();
+        private static SuccessDC zipBatch(string zipIterationName, IEnumerable<KeyValuePair<string, string>> fileChunkToZip, string _outDirectory)
+        {
+            SuccessDC success = new SuccessDC();
+
+            try
+            {
+                var zipFileName = Path.Combine(_outDirectory, zipIterationName);
+
+                if (fileChunkToZip.Count() > 0)
+                {
+                    using (var stream = File.OpenWrite(zipFileName))
+                    using (ZipArchive archive = new ZipArchive(stream, System.IO.Compression.ZipArchiveMode.Create))
+                        
+                        foreach (var file in fileChunkToZip)
+                        {
+                            try
+                            {
+                                if (file.Key != null)
+                                {
+                                    try
+                                    {
+                                        archive.CreateEntryFromFile(Path.GetFullPath(file.Value) + Path.GetFileName(file.Key), file.Key, CompressionLevel.Fastest);
+                                    }
+                                    catch { }; //sometimes we dont have the image actually so swallow error and move on
+                                }
+                                else
+                                {
+                                    log.Error(file.Key + " image key had error: " + file.Value);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                log.Error(ex.ToString());
+                                continue;
+                            }
+                        }
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.ToString());
+            }
+
+            success.blnSuccess = true;
+            return success;
+        }
+
+        private static SuccessDC TranslateNotdRiBodyData(object bodyData, MHHeaderRecordDC headerFile, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+            var data = new MHExNotdRiDC();
+
+            try
+            {
+                var iStat = ((IEnumerable)bodyData).Cast<MHNotdDC>().OrderBy(a => Convert.ToInt32(a.transactionNumber)).ToList();
+                data.headerBatchId = headerFile.batchId;
+                data.mailingNumber = iStat[0].mailingNumber;
+                data.totalPaymentAmount = iStat[0].totalPaymentAmount;
+                data.daysToPay = iStat[0].daysToPay;
+                data.paymentDueDate = TranslateToISODateTime(iStat[0].paymentDueDate);
+                data.tollViolationDate = TranslateToISODateTime(AddDaysToDate(iStat[0].paymentDueDate, 1).ToString());
+                data.billedAmount = iStat[0].billedAmount;
+                data.civilPenaltyFeeDue = TranslateMoney(iStat[0].civilPenaltyFeeDue);
+                data.paymentDueAmountWithPenalty = iStat[0].paymentDueAmountWithPenalty;
+                data.tollViolationGracePeriod = "1"; // iStat[0].tollViolationGracePeriod;
+                data.numberOfTrans = iStat.Count.ToString();
+                data.reissue = "Y";
+                data.amountDueAfter = iStat[0].amountDueAfter;
+                data.transactions = new List<MHExTransactionDC>();
+
+                foreach (var e in iStat)
+                {
+                    var fs = new MHExTransactionDC();
+                    if (e.exitPlazaCode != null && e.exitPlazaCode.Length > 0 && e.entryPlazaCode != null && e.entryPlazaCode.Length > 0)
+                    {
+                        //mapped plaza info
+                        var plazaData = new List<MHExPlazaInfoDC>();
+                        plazaData = _MHBO.GetPlazaInfoByIdFromAMS(Convert.ToInt64(e.entryPlazaCode), Convert.ToInt64(e.exitPlazaCode));
+                        if (!string.Equals(plazaData[0].EntryDecription.Trim(), plazaData[0].ExitDecription.Trim(), StringComparison.CurrentCulture))
+                        {
+                            //If something is comming into e.entryPlazaDescription we'll use it. (Covid dynamic label)
+                            fs.entryPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].EntryDecription : e.entryPlazaDescription;
+                            fs.entryPlazaCode = plazaData[0].EntryCode;
+                            fs.transactionEntryDateTime = TranslateToISODateTime(e.transactionEntryDateTime);
+                        }
+
+                        //If something is comming into e.entryPlazaDescription we'll use it. (Covid dynamic label)
+                        fs.exitPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].ExitDecription : e.entryPlazaDescription;
+                        fs.exitPlazaCode = plazaData[0].ExitCode;
+                        fs.transactionExitDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                        fs.locationCounty = plazaData[0].ExitCounty;
+                        fs.facilityName = plazaData[0].Facility;
+                    }
+                    fs.childRecordType = "TX"; 
+                    fs.licensePlateNumber = e.licensePlateNumber;
+                    fs.licensePlateState = e.licensePlateState;
+                    fs.transponderNumberOrPlateNumber = e.licensePlateNumber;
+                    fs.vehicleClassification = "";
+                    fs.transactionAmount = e.billedAmount;
+                    fs.runningBalanceAmount = e.amountDueAfter;
+                    fs.transactionNumber = e.transactionNumber;
+                    fs.transactionDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                    fs.transactionDescription = "Toll";
+
+                    fs.imageName = ParseImageName(e.imageName);
+                    if (fs.imageName == "NotAvailable.jpg")
+                    {
+                        success.vcResult = "Image not found where specified";
+                        log.Error(success.vcResult);
+                        return success;
+                    }
+
+                    fs.imageROIName = ParseImageName(e.roiImageName);
+                    if (fs.imageROIName == "NotAvailable.jpg")
+                    {
+                        success.vcResult = "ROI Image not found where specified";
+                        log.Error(success.vcResult);
+                        fs.imageROIName = String.Empty;
+                    }
+                    data.transactions.Add(fs);
+                };
+                success.blnSuccess = true;
+                success.objData = data;
+            }
+            catch (Exception ex)
+            {
+                success.vcResult = ex.InnerException.ToString();
+                log.Error(ex.Message, ex);
+            }
+            return success;
+        }
+        private static SuccessDC TranslateNotdBodyData(object bodyData, MHHeaderRecordDC headerFile, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+            var data = new MHExNotdDC();
+
+            try
+            {
+                var iStat = ((IEnumerable)bodyData).Cast<MHNotdDC>().OrderBy(a => Convert.ToInt32(a.transactionNumber)).ToList();
+                data.headerBatchId = headerFile.batchId;
+                data.mailingNumber = iStat[0].mailingNumber;
+                data.totalPaymentAmount = iStat[0].totalPaymentAmount;
+                data.daysToPay = iStat[0].daysToPay;
+                data.paymentDueDate = TranslateToISODateTime(iStat[0].paymentDueDate);
+                data.tollViolationDate = TranslateToISODateTime(AddDaysToDate(iStat[0].paymentDueDate, 1).ToString());
+                data.billedAmount = iStat[0].billedAmount;
+                data.civilPenaltyFeeDue = TranslateMoney(iStat[0].civilPenaltyFeeDue);
+                data.paymentDueAmountWithPenalty = iStat[0].paymentDueAmountWithPenalty;
+                data.tollViolationGracePeriod = "1"; // iStat[0].tollViolationGracePeriod;
+                data.numberOfTrans = iStat.Count.ToString();
+                data.reissue = "N";
+                data.amountDueAfter = iStat[0].amountDueAfter;
+                data.transactions = new List<MHExTransactionDC>();
+
+                foreach (var e in iStat)
+                {
+                    var fs = new MHExTransactionDC();
+                    if (e.exitPlazaCode != null && e.exitPlazaCode.Length > 0 && e.entryPlazaCode != null && e.entryPlazaCode.Length > 0)
+                    {
+                        //mapped plaza info
+                        var plazaData = new List<MHExPlazaInfoDC>();
+                        plazaData = _MHBO.GetPlazaInfoByIdFromAMS(Convert.ToInt64(e.entryPlazaCode), Convert.ToInt64(e.exitPlazaCode));
+                        if (!string.Equals(plazaData[0].EntryDecription.Trim(), plazaData[0].ExitDecription.Trim(), StringComparison.CurrentCulture))
+                        {
+                            fs.entryPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].EntryDecription : e.entryPlazaDescription;
+                            fs.entryPlazaCode = plazaData[0].EntryCode;
+                            fs.transactionEntryDateTime = TranslateToISODateTime(e.transactionEntryDateTime);
+                        }
+                        fs.exitPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].ExitDecription : e.entryPlazaDescription;
+                        fs.exitPlazaCode = plazaData[0].ExitCode;
+                        fs.transactionExitDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                        fs.locationCounty = plazaData[0].ExitCounty;
+                        fs.facilityName = plazaData[0].Facility;
+                    }
+                    fs.childRecordType = "TX"; 
+                    fs.licensePlateNumber = e.licensePlateNumber;
+                    fs.licensePlateState = e.licensePlateState;
+                    fs.transponderNumberOrPlateNumber = e.licensePlateNumber;
+                    fs.vehicleClassification = "";
+                    fs.transactionAmount = e.billedAmount;
+                    fs.runningBalanceAmount = e.amountDueAfter;
+                    fs.transactionNumber = e.transactionNumber;
+                    fs.transactionDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                    fs.transactionDescription = "Toll";
+
+                    fs.imageName = ParseImageName(e.imageName);
+                    if (fs.imageName == "NotAvailable.jpg")
+                    {
+                        success.vcResult = "Image not found where specified";
+                        log.Error(success.vcResult);
+                        return success;
+                    }
+
+                    fs.imageROIName = ParseImageName(e.roiImageName);
+                    if (fs.imageROIName == "NotAvailable.jpg")
+                    {
+                        success.vcResult = "ROI Image not found where specified";
+                        log.Error(success.vcResult);
+                        fs.imageROIName = String.Empty;
+                    }
+
+                    data.transactions.Add(fs);
+
+                };
+                success.blnSuccess = true;
+                success.objData = data;
+            }
+            catch (Exception ex)
+            {
+                success.vcResult = ex.InnerException.ToString();
+                log.Error(ex.Message, ex);
+            }
+            return success;
+        }
+
+        private static SuccessDC TranslateNotdSummaryRiBodyData(object bodyData, MHHeaderRecordDC headerFile, bool NotIndNOTDS, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+
+            if (NotIndNOTDS)
+            {
+                var data = new MHExNotdSummaryWScanLineNoNotdDC();
+                decimal totalAmount = 0;
+                try
+                {
+                    var iStat = ((IEnumerable)bodyData).Cast<MHNotdSummaryDC>().OrderBy(a => Convert.ToInt32(a.transactionNumber)).ToList(); // ThenBy(a => a.transactionExitDateTime).ToList();
+                    data.headerBatchId = headerFile.batchId;
+                    data.mailingNumber = iStat[0].mailingNumber;
+                    data.daysToPay = iStat[0].daysToPay;
+                    data.paymentDueDate = TranslateToISODateTime(iStat[0].paymentDueDate);
+                    data.tollViolationDate = TranslateToISODateTime(AddDaysToDate(TranslateToISODateTime(iStat[0].paymentDueDate ?? DateTime.Now.ToString()), 1).ToString());
+                    data.civilPenaltyFeeDue = TranslateMoney(iStat[0].civilPenaltyFeeDue);
+                    data.tollViolationGracePeriod = iStat[0].tollViolationGracePeriod;
+                    data.numberOfTrans = iStat[0].numberOfTrans;
+                    data.reissue = "Y";
+                    data.amountDueAfter = TranslateToISODateTime(iStat[0].paymentDueDate);
+                    data.transactions = new List<MHExTransactionWScanLineNoNotdDC>();
+
+                    foreach (var e in iStat.OrderBy(a => a.transactionNumber).ToList())
+                    {
+                        var fs = new MHExTransactionWScanLineNoNotdDC();
+                        if (e.exitPlazaCode != null && e.exitPlazaCode.Length > 0 && e.entryPlazaCode != null && e.entryPlazaCode.Length > 0)
+                        {
+                            //mapped plaza info
+                            var plazaData = new List<MHExPlazaInfoDC>();
+                            plazaData = _MHBO.GetPlazaInfoByIdFromAMS(Convert.ToInt64(e.entryPlazaCode), Convert.ToInt64(e.exitPlazaCode));
+                            if (!string.Equals(plazaData[0].EntryDecription.Trim(), plazaData[0].ExitDecription.Trim(), StringComparison.CurrentCulture))
+                            {
+                                fs.entryPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].EntryDecription : e.entryPlazaDescription;
+                                fs.entryPlazaCode = plazaData[0].EntryCode;
+                                fs.transactionEntryDateTime = TranslateToISODateTime(e.transactionEntryDateTime);
+                            }
+                            fs.exitPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].ExitDecription : e.entryPlazaDescription;
+                            fs.exitPlazaCode = plazaData[0].ExitCode;
+                            fs.transactionExitDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                            fs.locationCounty = plazaData[0].ExitCounty;
+                        }
+                        fs.childRecordType = "TX"; //e.childRecordType;
+                        fs.licensePlateNumber = e.licensePlateNumber;
+                        fs.licensePlateState = e.licensePlateState;
+                        fs.transponderNumberOrPlateNumber = e.licensePlateNumber;
+                        fs.vehicleClassification = "";
+                        fs.transactionAmount = e.transactionAmount;
+                        fs.transactionNumber = e.transactionNumber;
+                        fs.transactionDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                        fs.transactionDescription = "Toll";
+                        
+                        //difference
+                        fs.scanLineID = e.scanLineID;
+                        fs.imageName = ParseImageName(e.imageName);
+                        if (fs.imageName == "NotAvailable.jpg")
+                        {
+                            success.vcResult = "Image not found where specified";
+                            log.Error(success.vcResult);
+                            return success;
+                        }
+                        fs.imageROIName = ParseImageName(e.imageROIName);
+                        if (fs.imageROIName == "NotAvailable.jpg")
+                        {
+                            success.vcResult = "ROI Image not found where specified";
+                            log.Error(success.vcResult);
+                            fs.imageROIName = String.Empty;
+                        }
+                        fs.totalPaymentAmount = e.transactionAmount;
+                        fs.paymentDueDate = TranslateToISODateTime(e.paymentDueDate);
+                        fs.paymentDueAmountWithPenalty = TranslateMoney((Convert.ToDouble(e.transactionAmount) + Convert.ToDouble(data.civilPenaltyFeeDue)).ToString());
+                        fs.tollViolationDate = TranslateToISODateTime(e.tollViolationDate);
+
+                        totalAmount = totalAmount + Convert.ToDecimal(e.transactionAmount);
+
+                        data.transactions.Add(fs);
+                    };
+
+                    data.totalPaymentAmount = TranslateMoney(totalAmount.ToString());
+                    var amt = totalAmount + (Convert.ToDecimal(data.civilPenaltyFeeDue) * iStat.Count());
+                    data.paymentDueAmountWithPenalty = TranslateMoney(amt.ToString());
+                    data.billedAmount = totalAmount.ToString();
+
+                    success.blnSuccess = true;
+                    success.objData = data;
+                }
+                catch (Exception ex)
+                {
+                    success.vcResult = ex.InnerException.ToString();
+                    log.Error(ex.Message, ex);
+                }
+            }
+            else
+            {
+                var data = new MHExNotdSummaryDC();
+                decimal totalAmount = 0;
+                try
+                {
+                    var iStat = ((IEnumerable)bodyData).Cast<MHNotdSummaryDC>().OrderBy(a => Convert.ToInt32(a.transactionNumber)).ToList(); // ThenBy(a => a.transactionExitDateTime).ToList();
+                    data.headerBatchId = headerFile.batchId;
+                    data.mailingNumber = iStat[0].mailingNumber;
+                    data.daysToPay = iStat[0].daysToPay;
+                    data.paymentDueDate = TranslateToISODateTime(iStat[0].paymentDueDate);
+                    data.tollViolationDate = TranslateToISODateTime(AddDaysToDate(TranslateToISODateTime(iStat[0].paymentDueDate ?? DateTime.Now.ToString()), 1).ToString());
+                    data.civilPenaltyFeeDue = TranslateMoney(iStat[0].civilPenaltyFeeDue);
+                    data.tollViolationGracePeriod = iStat[0].tollViolationGracePeriod;
+                    data.numberOfTrans = iStat[0].numberOfTrans;
+                    data.reissue = "N";
+                    data.amountDueAfter = TranslateToISODateTime(iStat[0].paymentDueDate);
+                    data.transactions = new List<MHExTransactionDC>();
+
+                    foreach (var e in iStat.OrderBy(a => a.transactionNumber).ToList())
+                    {
+                        var fs = new MHExTransactionDC();
+                        if (e.exitPlazaCode != null && e.exitPlazaCode.Length > 0 && e.entryPlazaCode != null && e.entryPlazaCode.Length > 0)
+                        {
+                            //mapped plaza info
+                            var plazaData = new List<MHExPlazaInfoDC>();
+                            plazaData = _MHBO.GetPlazaInfoByIdFromAMS(Convert.ToInt64(e.entryPlazaCode), Convert.ToInt64(e.exitPlazaCode));
+                            if (!string.Equals(plazaData[0].EntryDecription.Trim(), plazaData[0].ExitDecription.Trim(), StringComparison.CurrentCulture))
+                            {
+                                fs.entryPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].EntryDecription : e.entryPlazaDescription;
+                                fs.entryPlazaCode = plazaData[0].EntryCode;
+                                fs.transactionEntryDateTime = TranslateToISODateTime(e.transactionEntryDateTime);
+                            }
+                            fs.exitPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].ExitDecription : e.entryPlazaDescription;
+                            fs.exitPlazaCode = plazaData[0].ExitCode;
+                            fs.transactionExitDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                            fs.locationCounty = plazaData[0].ExitCounty;
+                        }
+                        fs.childRecordType = "TX"; //e.childRecordType;
+                        fs.licensePlateNumber = e.licensePlateNumber;
+                        fs.licensePlateState = e.licensePlateState;
+                        fs.transponderNumberOrPlateNumber = e.licensePlateNumber;
+                        fs.vehicleClassification = "";
+                        fs.transactionAmount = e.transactionAmount;
+                        fs.transactionNumber = e.transactionNumber;
+                        fs.transactionDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                        fs.transactionDescription = "Toll";
+
+                        totalAmount = totalAmount + Convert.ToDecimal(e.transactionAmount);
+
+                        data.transactions.Add(fs);
+                    };
+
+                    data.totalPaymentAmount = TranslateMoney(totalAmount.ToString());
+                    var amt = totalAmount + (Convert.ToDecimal(data.civilPenaltyFeeDue) * iStat.Count());
+                    data.paymentDueAmountWithPenalty = TranslateMoney(amt.ToString());
+                    data.billedAmount = totalAmount.ToString();
+
+                    success.blnSuccess = true;
+                    success.objData = data;
+                }
+                catch (Exception ex)
+                {
+                    success.vcResult = ex.InnerException.ToString();
+                    log.Error(ex.Message, ex);
+                }
+            }
+            
+            return success; ;
+        }
+
+        private static SuccessDC TranslateNotdSummaryBodyData(object bodyData, MHHeaderRecordDC headerFile, bool NotIndNOTDS, MHStatementManagerBO _MHBO)
+        {
+            SuccessDC success = new SuccessDC();
+
+            if (NotIndNOTDS)
+            {
+                var data = new MHExNotdSummaryWScanLineNoNotdDC();
+                decimal totalAmount = 0;
+                try
+                {
+                    var iStat = ((IEnumerable)bodyData).Cast<MHNotdSummaryDC>().OrderBy(a => Convert.ToInt32(a.transactionNumber)).ToList(); // ThenBy(a => a.transactionExitDateTime).ToList();
+                    data.headerBatchId = headerFile.batchId;
+                    data.mailingNumber = iStat[0].mailingNumber;
+                    data.daysToPay = iStat[0].daysToPay;
+                    data.paymentDueDate = TranslateToISODateTime(iStat[0].paymentDueDate);
+                    data.tollViolationDate = TranslateToISODateTime(AddDaysToDate(TranslateToISODateTime(iStat[0].paymentDueDate ?? DateTime.Now.ToString()), 1).ToString());
+                    data.civilPenaltyFeeDue = TranslateMoney(iStat[0].civilPenaltyFeeDue);
+                    data.tollViolationGracePeriod = iStat[0].tollViolationGracePeriod;
+                    data.numberOfTrans = iStat[0].numberOfTrans;
+                    data.reissue = "N";
+                    data.amountDueAfter = TranslateToISODateTime(iStat[0].paymentDueDate);
+                    data.transactions = new List<MHExTransactionWScanLineNoNotdDC>();
+
+                    foreach (var e in iStat.OrderBy(a => a.transactionNumber).ToList())
+                    {
+                        var fs = new MHExTransactionWScanLineNoNotdDC();
+                        if (e.exitPlazaCode != null && e.exitPlazaCode.Length > 0 && e.entryPlazaCode != null && e.entryPlazaCode.Length > 0)
+                        {
+                            //mapped plaza info
+                            var plazaData = new List<MHExPlazaInfoDC>();
+                            plazaData = _MHBO.GetPlazaInfoByIdFromAMS(Convert.ToInt64(e.entryPlazaCode), Convert.ToInt64(e.exitPlazaCode));
+                            if (!string.Equals(plazaData[0].EntryDecription.Trim(), plazaData[0].ExitDecription.Trim(), StringComparison.CurrentCulture))
+                            {
+                                fs.entryPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].EntryDecription : e.entryPlazaDescription;
+                                fs.entryPlazaCode = plazaData[0].EntryCode;
+                                fs.transactionEntryDateTime = TranslateToISODateTime(e.transactionEntryDateTime);
+                            }
+                            fs.exitPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].ExitDecription : e.entryPlazaDescription;
+                            fs.exitPlazaCode = plazaData[0].ExitCode;
+                            fs.transactionExitDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                            fs.locationCounty = plazaData[0].ExitCounty;
+                        }
+                        fs.childRecordType = "TX"; 
+                        fs.licensePlateNumber = e.licensePlateNumber;
+                        fs.licensePlateState = e.licensePlateState;
+                        fs.transponderNumberOrPlateNumber = e.licensePlateNumber;
+                        fs.vehicleClassification = "";
+                        fs.transactionAmount = e.transactionAmount;
+                        fs.transactionNumber = e.transactionNumber;
+                        fs.transactionDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                        fs.transactionDescription = "Toll";
+
+                        //difference
+                        fs.scanLineID = e.scanLineID;
+                        fs.imageName = ParseImageName(e.imageName);
+                        if (fs.imageName == "NotAvailable.jpg")
+                        {
+                            success.vcResult = "Image not found where specified";
+                            log.Error(success.vcResult);
+                            return success;
+                        }
+                        fs.imageROIName = ParseImageName(e.imageROIName);
+                        if (fs.imageROIName == "NotAvailable.jpg")
+                        {
+                            success.vcResult = "ROI Image not found where specified";
+                            log.Error(success.vcResult);
+                            fs.imageROIName = String.Empty;
+                        }
+                        fs.totalPaymentAmount = e.transactionAmount;
+                        fs.paymentDueDate = TranslateToISODateTime(e.paymentDueDate);
+                        fs.paymentDueAmountWithPenalty = TranslateMoney((Convert.ToDouble(e.transactionAmount) + Convert.ToDouble(data.civilPenaltyFeeDue)).ToString());
+                        fs.tollViolationDate = TranslateToISODateTime(e.tollViolationDate);
+
+                        totalAmount = totalAmount + Convert.ToDecimal(e.transactionAmount);
+
+                        data.transactions.Add(fs);
+                    };
+
+                    data.totalPaymentAmount = TranslateMoney(totalAmount.ToString());
+                    var amt = totalAmount + (Convert.ToDecimal(data.civilPenaltyFeeDue) * iStat.Count());
+                    data.paymentDueAmountWithPenalty = TranslateMoney(amt.ToString());
+                    data.billedAmount = totalAmount.ToString();
+
+                    success.blnSuccess = true;
+                    success.objData = data;
+                }
+                catch (Exception ex)
+                {
+                    success.vcResult = ex.InnerException.ToString();
+                    log.Error(ex.Message, ex);
+                }
+            }
+            else
+            {
+                var data = new MHExNotdSummaryDC();
+                decimal totalAmount = 0;
+                try
+                {
+                    var iStat = ((IEnumerable)bodyData).Cast<MHNotdSummaryDC>().OrderBy(a => Convert.ToInt32(a.transactionNumber)).ToList(); // ThenBy(a => a.transactionExitDateTime).ToList();
+                    if (iStat.Count != 0)
+                    {
+                        data.headerBatchId = headerFile.batchId;
+                        data.mailingNumber = iStat[0].mailingNumber;
+                        data.daysToPay = iStat[0].daysToPay;
+                        data.paymentDueDate = TranslateToISODateTime(iStat[0].paymentDueDate);
+                        data.tollViolationDate = TranslateToISODateTime(AddDaysToDate(TranslateToISODateTime(iStat[0].paymentDueDate ?? DateTime.Now.ToString()), 1).ToString());
+                        data.civilPenaltyFeeDue = TranslateMoney(iStat[0].civilPenaltyFeeDue);
+                        data.tollViolationGracePeriod = iStat[0].tollViolationGracePeriod;
+                        data.numberOfTrans = iStat[0].numberOfTrans;
+                        data.reissue = "N";
+                        data.amountDueAfter = TranslateToISODateTime(iStat[0].paymentDueDate);
+                        data.transactions = new List<MHExTransactionDC>();
+
+                        foreach (var e in iStat.OrderBy(a => a.transactionNumber).ToList())
+                        {
+                            var fs = new MHExTransactionDC();
+                            if (e.exitPlazaCode != null && e.exitPlazaCode.Length > 0 && e.entryPlazaCode != null && e.entryPlazaCode.Length > 0)
+                            {
+                                //mapped plaza info
+                                var plazaData = new List<MHExPlazaInfoDC>();
+                                plazaData = _MHBO.GetPlazaInfoByIdFromAMS(Convert.ToInt64(e.entryPlazaCode), Convert.ToInt64(e.exitPlazaCode));
+                                if (!string.Equals(plazaData[0].EntryDecription.Trim(), plazaData[0].ExitDecription.Trim(), StringComparison.CurrentCulture))
+                                {
+                                    fs.entryPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].EntryDecription : e.entryPlazaDescription;
+                                    fs.entryPlazaCode = plazaData[0].EntryCode;
+                                    fs.transactionEntryDateTime = TranslateToISODateTime(e.transactionEntryDateTime);
+                                }
+                                fs.exitPlazaDescription = string.IsNullOrEmpty(e.entryPlazaDescription) ? plazaData[0].ExitDecription : e.entryPlazaDescription;
+                                fs.exitPlazaCode = plazaData[0].ExitCode;
+                                fs.transactionExitDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                                fs.locationCounty = plazaData[0].ExitCounty;
+                            }
+                            fs.childRecordType = "TX"; 
+                            fs.licensePlateNumber = e.licensePlateNumber;
+                            fs.licensePlateState = e.licensePlateState;
+                            fs.transponderNumberOrPlateNumber = e.licensePlateNumber;
+                            fs.vehicleClassification = "";
+                            fs.transactionAmount = e.transactionAmount;
+                            fs.transactionNumber = e.transactionNumber;
+                            fs.transactionDateTime = TranslateToISODateTime(e.transactionExitDateTime);
+                            fs.transactionDescription = "Toll";
+
+                            totalAmount = totalAmount + Convert.ToDecimal(e.transactionAmount);
+
+                            data.transactions.Add(fs);
+                        };
+                    }
+                    data.totalPaymentAmount = TranslateMoney(totalAmount.ToString());
+                    var amt = totalAmount + (Convert.ToDecimal(data.civilPenaltyFeeDue) * iStat.Count());
+                    data.paymentDueAmountWithPenalty = TranslateMoney(amt.ToString());
+                    data.billedAmount = totalAmount.ToString();
+
+                    success.blnSuccess = true;
+                    success.objData = data;
+                }
+                catch (Exception ex)
+                {
+                    success.vcResult = ex.InnerException.ToString();
+                    log.Error(ex.Message, ex);
+                }
+            }
+            return success; ;
+        }
+
+        public static string TranslateToISODateTime(string date)
+        {
+            var returnDate = string.Empty;
+
+            if (date.Length > 0)
+            {
+                try
+                {
+                    DateTime tempDate = Convert.ToDateTime(date);
+                    returnDate = tempDate.ToString("yyyy-MM-ddTHH:mm:ss");
+                }
+                catch (Exception ex)
+                {
+                    log.Error(ex.Message, ex);
+                }
+            }
+
+            return returnDate;
+        }
+
+        public static DateTime AddDaysToDate(string date, long increment)
+        {
+            var returnDate = DateTime.Now;
+
+            if (date.Length > 0)
+            {
+                try
+                {
+                    DateTime tempDate = Convert.ToDateTime(date);
+                    returnDate = tempDate.AddDays(increment);
+                }
+                catch (Exception ex)
+                {
+                    log.Error(ex.Message, ex);
+                }
+            }
+            return returnDate;
+        }
+
+        public static string TranslateToMailingDate(MHHeaderRecordDC headerRecs, MHStatementManagerBO _MHBO)
+        {
+            var returnDate = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+            returnDate = GetMailDate(headerRecs, _MHBO);
+
+            if (headerRecs.dataFileId != 0)
+            {
+                var mailingOffset = _MHBO.GetMailingOffSetByDataFileID(Convert.ToInt32(headerRecs.dataFileId));
+
+                if (mailingOffset > 0)
+                {
+                    try
+                    {
+                        DateTime tempDate = Convert.ToDateTime(returnDate).AddDays(mailingOffset);
+                        returnDate = tempDate.ToString("yyyy-MM-ddTHH:mm:ss");
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Error(ex.Message, ex);
+                    }
+                }
+            }
+            return returnDate;
+        }
+
+        private static string TranslateFileTypeToNormalizedType(string mailerType)
+        {
+            string normalizedFileType = string.Empty;
+
+            try
+            {
+                switch (mailerType)
+                {
+                    case "RENEWHATEMB":
+                        normalizedFileType = "RENEWHATEMB";
+                        break;
+                    default:
+                        normalizedFileType = mailerType;
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.Message, ex);
+            }
+
+            return normalizedFileType;
+        }
+
+        private static MHBundledExportDC TranslateBundleForExport(List<MHCommonAndBodyDataDC> bodyBundledData, MHHeaderRecordDC headerFile, string commonNameTracker, MHStatementManagerBO _MHBO)
+        {
+            var export = new MHBundledExportDC();
+            var records = new List<MHExBundledRecordsDC>();
+            var returnDate = DateTime.Now.ToString("yyyyMMddHHmm");
+            string normFileType = TranslateFileTypeToNormalizedType(headerFile.fileType);
+
+            try
+            {
+                export = new MHBundledExportDC();
+
+                export.fileId = "MDTA_MH_" + headerFile.fileType + "_" + commonNameTracker + "";
+                export.fileType = normFileType;
+                export.fileDate = TranslateToISODateTime(headerFile.fileDate);
+                export.recordCount = bodyBundledData.Count.ToString();
+                export.version = headerFile.version;
+
+                export.records = new List<MHExBundledRecordsDC>();
+
+                foreach (MHCommonAndBodyDataDC bodyData in bodyBundledData)
+                {
+                    List<MHMessagesDC> msgs = new List<MHMessagesDC>();
+                    long entityID = 0; 
+                    string deliveryType = string.Empty;
+
+                    MHCommonFieldsDC commonFile = _MHBO.GetCommonFieldsByHeaderID(bodyData.headerBatchId);
+
+                    deliveryType = commonFile.deliveryType;
+
+                    MHExMessagesDC tmpMessages = new MHExMessagesDC();
+                    if (msgs.Count > 0)
+                    {
+                        tmpMessages.message1 = msgs[0].message1;
+                        tmpMessages.message2 = msgs[0].message2;
+                        tmpMessages.message3 = msgs[0].message3;
+                    }
+
+                    List<MHHeaderRecordDC> bodyHederRec = _MHBO.GetHeaderRecordByHeaderID(bodyData.headerBatchId);
+
+                    string tDate = TranslateToMailingDate(headerFile, _MHBO);
+
+                    var rec = new MHExBundledRecordsDC
+                    {
+                        person = new MHExPersonDC
+                        {
+                            accountNumber = commonFile.accountNumber,
+                            companyName = commonFile.companyName,
+                            email = commonFile.email,
+                            firstName = commonFile.firstName,
+                            middleName = commonFile.middleName,
+                            lastName = commonFile.lastName,
+                            suffix = commonFile.suffix
+                        },
+                        address = new MHExAddressDC
+                        {
+                            line1 = commonFile.line1,
+                            line2 = commonFile.line2,
+                            city = commonFile.city,
+                            state = commonFile.state,
+                            zipCode = commonFile.zipCode,
+                            zipPlusFour = commonFile.zipCodePlus,
+                            country = commonFile.county
+                        },
+                        metadata = new MHExMetadataDC
+                        {
+                            documentId = entityID.ToString() ?? "0",
+                            letterId = headerFile.letterId.ToString(),
+                            date = TranslateToISODateTime(commonFile.documentDate ?? DateTime.Now.ToString()),
+                            language = commonFile.language,
+                            deliveryType = deliveryType,
+                            noticeMailingDate = TranslateToISODateTime(tDate),
+                            scanLineID = GetScanLineID(bodyHederRec[0], _MHBO),
+                        },
+
+                        data = bodyData.bodyDataFiles,
+
+                        messages = tmpMessages
+                    };
+                    export.records.Add(rec);
+
+                    Console.WriteLine("Translated rec for: " + commonFile.headerBatchId);
+                    commonFile = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.Message, ex);
+            }
+
+            return export;
+        }
+
+        private static List<long> AddNOTDStoQNOtificationsFromSummaries(long QRequestID, string FileType, MHStatementManagerBO _MHBO)
+        {
+            //Integrity does not deal with individual
+            //NOTDS but they are need for evidence pacakages
+            //so we are automating the process for the CSRs
+            SuccessDC success = new SuccessDC();
+            Dictionary<long, string> dNotds = new Dictionary<long, string>();
+            Dictionary<long, long> dInvoices = new Dictionary<long, long>();
+            List<MHDataFilesDC> dataTypeInfo = new List<MHDataFilesDC>();
+            List<MHDataFilesDC> dataTypeInfoNOTD = new List<MHDataFilesDC>();
+            List<MHDataFilesDC> dataTypeInfoNOTDRI = new List<MHDataFilesDC>();
+
+            List<long> invociesToAdd = new List<long>();
+
+            try
+            {
+                dNotds.Add(QRequestID, FileType);
+                dataTypeInfoNOTD = _MHBO.GetDataFileByDataFileType("NOTD");
+                dataTypeInfoNOTDRI = _MHBO.GetDataFileByDataFileType("NOTDRI");
+
+                foreach (var notd in dNotds)
+                {
+                    dInvoices = _MHBO.GetInvoiceIDFromQRquestID(notd.Key);
+                    foreach (var inv in dInvoices)
+                    {
+                        if (notd.Value == "NOTDSUMMARY")
+                            dataTypeInfo = dataTypeInfoNOTD;
+                        if (notd.Value == "NOTDSUMMARYRI")
+                            dataTypeInfo = dataTypeInfoNOTDRI;
+
+                        success = _MHBO.AddNOTDsFromNOTDSUMMARYSToHeaderRecords(inv.Value, inv.Key, dataTypeInfo[0].DatafileID, dataTypeInfo[0].LetterID, dataTypeInfo[0].FileType);
+                        invociesToAdd.Add(Convert.ToInt64(success.vcResult));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                success.vcResult = ex.InnerException.ToString();
+                log.Error(ex.Message, ex);
+            }
+
+            return invociesToAdd;
+        }
+
+        private List<MHHeaderRecordDC> GetDataFileListToProcess()
+        {
+            List<MHHeaderRecordDC> dataToProcess = new List<MHHeaderRecordDC>();
+            try
+            {
+                dataToProcess = _MHBO.GetDataFilesToProcess();
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.Message, ex);
+            }
+            return dataToProcess;
+        }
+
+        public static string TranslateMoney(string toTranslate)
+        {
+            var translatedAmount = "0.00";
+            if (toTranslate != null && toTranslate.Length > 0)
+                translatedAmount = toTranslate;
+
+            try
+            {
+                translatedAmount = string.Format("{0:#0.00}", Convert.ToDecimal(translatedAmount ?? "0.00"));
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.Message, ex);
+            }
+            return translatedAmount;
+        }
+
+        public static string GetScanLineID(MHHeaderRecordDC headerRecs, MHStatementManagerBO _MHBO)
+        {
+            string scanLineID = string.Empty;
+
+            try
+            {
+                switch (headerRecs.fileType)
+                {
+                    case "NOTDSUMMARY":
+                        scanLineID = _MHBO.GetNOTDSummaryByHeaderID(headerRecs.batchId)[0].scanLineID;
+                        break;
+                    case "NOTDSUMMARYRI":
+                        scanLineID = _MHBO.GetNoTDSummaryRIByHeaderID(headerRecs.batchId)[0].scanLineID;
+                        break;
+                    case "NOTD":
+                        scanLineID = _MHBO.GetNoTDByHeaderID(headerRecs.batchId)[0].scanLineID;
+                        break;
+                    case "NOTDRI":
+                        scanLineID = _MHBO.GetNoTDRIByHeaderID(headerRecs.batchId)[0].scanLineID;
+                        break;
+                    default:
+                        scanLineID = string.Empty;
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.Message, ex);
+            }
+
+            return scanLineID;
+        }
+
+        public static string GetMailDate(MHHeaderRecordDC headerRecs, MHStatementManagerBO _MHBO)
+        {
+            var mailingDate = DateTime.Now.ToString();
+            object objDate = null;
+
+            try
+            {
+                switch (headerRecs.fileType)
+                {
+                    case "NOTDSUMMARY":
+                        objDate = _MHBO.GetNOTDSummaryByHeaderID(Convert.ToInt64(headerRecs.batchId));
+                        mailingDate = ((IEnumerable)objDate).Cast<MHNotdSummaryDC>().ToList()[0].noticeMailingDate;
+                        break;
+                    case "NOTDSUMMARYRI":
+                        objDate = _MHBO.GetNoTDSummaryRIByHeaderID(Convert.ToInt64(headerRecs.batchId));
+                        mailingDate = ((IEnumerable)objDate).Cast<MHNotdSummaryRiDC>().ToList()[0].noticeMailingDate;
+                        break;
+                    case "NOTD":
+                        objDate = _MHBO.GetNoTDByHeaderID(Convert.ToInt64(headerRecs.batchId));
+                        mailingDate = ((IEnumerable)objDate).Cast<MHNotdDC>().ToList()[0].noticeMailingDate;
+                        break;
+                    case "NOTDRI":
+                        objDate = _MHBO.GetNoTDRIByHeaderID(Convert.ToInt64(headerRecs.batchId));
+                        mailingDate = ((IEnumerable)objDate).Cast<MHNotdRiDC>().ToList()[0].noticeMailingDate;
+                        break;
+                    case "CITATION":
+                        objDate = _MHBO.GetCitationByHeaderID(Convert.ToInt64(headerRecs.batchId));
+                        mailingDate = ((IEnumerable)objDate).Cast<MHCitationDC>().ToList()[0].noticeMailingDate.ToString();
+                        break;
+                    case "MVAREFERRAL":
+                        objDate = _MHBO.GetMVAReferralByHeaderID(Convert.ToInt64(headerRecs.batchId));
+                        mailingDate = ((IEnumerable)objDate).Cast<MHMVAReferralDC>().ToList()[0].noticeMailingDate;
+                        break;
+                    case "MVASUSPENSION":
+                        objDate = _MHBO.GetMVASuspensionByHeaderID(Convert.ToInt64(headerRecs.batchId));
+                        mailingDate = ((IEnumerable)objDate).Cast<MHMVASuspensionDC>().ToList()[0].noticeMailingDate;
+                        break;
+                    case "FINALTVN":
+                        objDate = _MHBO.GetfinalTVNByHeaderID(Convert.ToInt64(headerRecs.batchId));
+                        mailingDate = ((IEnumerable)objDate).Cast<MHFinalTVNDC>().ToList()[0].noticeDate;
+                        break;
+                    default:
+                        mailingDate = DateTime.Now.ToString();
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.Message, ex);
+            }
+
+            return mailingDate;
+        }
+
+        public static string ParseImageName(string imgPath)
+        {
+            Dictionary<string, string> imgInfo = new Dictionary<string, string>();
+            string img = String.Empty;
+            string path = String.Empty;
+
+            try
+            {
+                //testing
+                //imgPath = @"C:\Images\153205646_501_7_20210522143505879_FRLP.jpg";
+                if (!File.Exists(imgPath))
+                {
+                    img = "NotAvailable.jpg";
+                    return img;
+                }
+
+                long length = new System.IO.FileInfo(imgPath).Length;
+                if (length <= 0)
+                {
+                    img = "NotAvailable.jpg";
+                    return img;
+                }
+
+                var lastSlashIndex = imgPath.LastIndexOf('\\');
+                img = imgPath.Substring((lastSlashIndex + 1));
+                path = imgPath.Substring(0, imgPath.Length - img.Length);
+
+                if (img.Length == 1)
+                    img = string.Empty;
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.InnerException.ToString());
+            }
+            return img;
+        }
+
+        #region Private Members
+        private SuccessDC UploadFiles()
+        {
+            SuccessDC success = new SuccessDC();
+
+            if (!Directory.Exists(_outDirectory))
+                return success;
+
+            fileServerManager = new SFTPServerManager();
+            fileServerManager.ServerAddress = outgoingFTPLocation;
+            fileServerManager.OutPwd = outgoingFTPPassword;
+            fileServerManager.OutUser = outgoingFTPUser;
+            fileServerManager.InPwd = outgoingFTPPassword;
+            fileServerManager.InUser = outgoingFTPUser;
+
+            fileServerManager.UploadDirectory = outgoingFTPDailyFilesFolder;
+            fileServerManager.FinalUploadDirectory = outgoingFTPDailyFilesFinalFolder;
+
+            var files = Directory.GetFiles(_outDirectory);
+            List<string> filesToArchice = new List<string>();
+
+            //upload
+            foreach (var file in files)
+            {
+                try
+                {
+                    string fileName = Path.GetFileName(file);
+                    if (useSshPrivateKey)
+                    {
+                        fileServerManager.UseSshPrivateKey = true;
+                        fileServerManager.SshPrivateKeyPassphrase = sshPrivateKeyPassphrase;
+                        fileServerManager.SshPrivateKeyPath = sshPrivateKeyPath;
+                    }
+                    fileServerManager.UploadFile(file, fileName);
+
+                    success.blnSuccess = true;
+                }
+                catch (Exception ex)
+                {
+                    log.Error(ex.Message, ex);
+                }
+                Console.WriteLine("1 of: " + files.Count().ToString() + " uploaded.");
+            }
+
+            //move
+            foreach (var file in files)
+            {
+                try
+                {
+                    string fileName = Path.GetFileName(file);
+                    string sourcePath = String.Format("{0}{1}", fileServerManager.UploadDirectory, fileName);
+                    string targetPath = String.Format("{0}{1}", fileServerManager.FinalUploadDirectory, fileName);
+                    fileServerManager.MoveFile(sourcePath, targetPath);
+
+                    filesToArchice.Add(file);
+                }
+                catch (Exception ex)
+                {
+                    log.Error(ex.Message, ex);
+                }
+            }
+
+            //archive
+            foreach (var file in filesToArchice)
+            {
+                try
+                {
+                    //mark uploaded
+                    string fileName = Path.GetFileName(file);
+                    List<MHHeaderRecordDC> headerRecs = new List<MHHeaderRecordDC>();
+                    headerRecs = _MHBO.GetHeaderRecordByJsonFileName(fileName);
+                    foreach (MHHeaderRecordDC hr in headerRecs)
+                    {
+                        _MHBO.UpdateHeaderRecordAsTransferred(hr.batchId);
+                    }
+
+                    ArchiveFile(file);
+                }
+                catch (Exception ex)
+                {
+                    log.Error(ex.Message, ex);
+                }
+            }
+            return success;
+        }
+
+
+        private void ArchiveFile(string file)
+        {
+            try
+            {
+                string today = DateTime.Today.ToString("yyyyMMdd");
+                string archivePath = Path.Combine(_archiveDirectory, today);
+                if (!Directory.Exists(archivePath))
+                    Directory.CreateDirectory(archivePath);
+
+                string fileName = Path.GetFileName(file);
+                File.Move(file, Path.Combine(archivePath, fileName));
+
+                log.Info(string.Format("File '{0}' was archived successfully.", fileName));
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.Message, ex);
+            }
+        }
+
+        private void ArchiveFailedFile(string file)
+        {
+            try
+            {
+                string today = DateTime.Today.ToString("yyyyMMdd");
+                string archivePath = Path.Combine(_failedDirectory, today);
+                if (!Directory.Exists(archivePath))
+                    Directory.CreateDirectory(archivePath);
+
+                string fileName = Path.GetFileName(file);
+                File.Move(file, Path.Combine(archivePath, fileName));
+
+                log.Info(string.Format("Failed File '{0}' was archived successfully.", fileName));
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex.Message, ex);
+            }
+        }
+
+        #endregion
+    }
+
+}
+
